@@ -1,14 +1,39 @@
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "MCP expects POST" });
+  // MCP handshake / health check
+  if (req.method === "GET") {
+    return res.status(200).json({
+      name: "eBay MCP",
+      tools: [
+        {
+          name: "search_ebay",
+          description: "Search live eBay listings",
+          inputSchema: {
+            type: "object",
+            properties: {
+              query: { type: "string" },
+              limit: { type: "number" }
+            },
+            required: ["query"]
+          }
+        }
+      ]
+    });
   }
 
-  const { tool, input } = req.body;
+  if (req.method !== "POST") {
+    return res.status(405).json({ error: "Method not allowed" });
+  }
+
+  const { tool, input } = req.body || {};
+
+  if (!tool) {
+    return res.status(200).json({ ok: true });
+  }
 
   try {
     if (tool === "search_ebay") {
       const query = encodeURIComponent(input.query || "lego");
-      const limit = input.limit || 10;
+      const limit = input.limit || 12;
 
       const tokenRes = await fetch("https://api.ebay.com/identity/v1/oauth2/token", {
         method: "POST",
