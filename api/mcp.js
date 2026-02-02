@@ -22,45 +22,81 @@ export default async function handler(req, res) {
     });
   }
 
-  // MCP requires POST
   if (req.method !== "POST") {
     return res.status(405).end();
   }
 
-  const body =
-    typeof req.body === "object" && req.body !== null ? req.body : {};
+  const body = req.body;
 
-  const { id, method } = body;
+  // Handle batch requests
+  const requests = Array.isArray(body) ? body : [body];
 
-  // MCP: initialize
-  if (method === "initialize") {
-    return res.status(200).json({
+  const responses = requests.map((reqItem) => {
+    const { id, method } = reqItem || {};
+
+    if (method === "initialize") {
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          protocolVersion: "2024-11-05",
+          capabilities: {
+            tools: {},
+          },
+          serverInfo: {
+            name: "eBay MCP",
+            version: "1.0.0",
+          },
+        },
+      };
+    }
+
+    if (method === "tools/list") {
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          tools: [
+            {
+              name: "search_ebay",
+              description: "Search live eBay listings",
+              inputSchema: {
+                type: "object",
+                properties: {
+                  query: { type: "string" },
+                  limit: { type: "number" },
+                },
+                required: ["query"],
+              },
+            },
+          ],
+        },
+      };
+    }
+
+    if (method === "tools/call") {
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          content: [
+            {
+              type: "text",
+              text: "Tool connected successfully (stub)",
+            },
+          ],
+        },
+      };
+    }
+
+    // Default safe response
+    return {
       jsonrpc: "2.0",
       id,
-      result: {
-        protocolVersion: "2024-11-05",
-        capabilities: {
-          tools: {},
-        },
-        serverInfo: {
-          name: "eBay MCP",
-          version: "1.0.0",
-        },
-      },
-    });
-  }
+      result: null,
+    };
+  });
 
-  // MCP: tools/list (REQUIRED)
-  if (method === "tools/list") {
-    return res.status(200).json({
-      jsonrpc: "2.0",
-      id,
-      result: {
-        tools: [
-          {
-            name: "search_ebay",
-            description: "Search live eBay listings",
-            inputSchema: {
-              type: "object",
-              properties: {
-                query: { type: "string" },
+  // Single request → single response
+  return res.status(200).json(responses.length === 1 ? responses[0] : responses);
+}
