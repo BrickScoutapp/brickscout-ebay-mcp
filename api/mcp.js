@@ -14,7 +14,7 @@ export default async function handler(req, res) {
     return res.status(200).end();
   }
 
-  // Health check (Base44 GET ping)
+  // Health check
   if (req.method === "GET") {
     return res.status(200).json({
       status: "ok",
@@ -22,13 +22,17 @@ export default async function handler(req, res) {
     });
   }
 
-  // Accept POST even if body is empty
+  // MCP requires POST
+  if (req.method !== "POST") {
+    return res.status(405).end();
+  }
+
   const body =
     typeof req.body === "object" && req.body !== null ? req.body : {};
 
-  const { id = "init", method = "initialize" } = body;
+  const { id, method } = body;
 
-  // MCP initialize (must NEVER fail)
+  // MCP: initialize
   if (method === "initialize") {
     return res.status(200).json({
       jsonrpc: "2.0",
@@ -46,10 +50,17 @@ export default async function handler(req, res) {
     });
   }
 
-  // Safe fallback (never 400)
-  return res.status(200).json({
-    jsonrpc: "2.0",
-    id,
-    result: null,
-  });
-}
+  // MCP: tools/list (REQUIRED)
+  if (method === "tools/list") {
+    return res.status(200).json({
+      jsonrpc: "2.0",
+      id,
+      result: {
+        tools: [
+          {
+            name: "search_ebay",
+            description: "Search live eBay listings",
+            inputSchema: {
+              type: "object",
+              properties: {
+                query: { type: "string" },
