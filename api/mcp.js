@@ -1,5 +1,11 @@
+export const config = {
+  api: {
+    bodyParser: true,
+  },
+};
+
 export default async function handler(req, res) {
-  // CORS (Base44 requires this)
+  // CORS
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -8,7 +14,7 @@ export default async function handler(req, res) {
     return res.status(200).end();
   }
 
-  // Health check (GET)
+  // Health check (Base44 GET ping)
   if (req.method === "GET") {
     return res.status(200).json({
       status: "ok",
@@ -16,14 +22,13 @@ export default async function handler(req, res) {
     });
   }
 
-  // MCP requires POST
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
-  }
+  // Accept POST even if body is empty
+  const body =
+    typeof req.body === "object" && req.body !== null ? req.body : {};
 
-  const { jsonrpc, id, method } = req.body || {};
+  const { id = "init", method = "initialize" } = body;
 
-  // MCP initialize
+  // MCP initialize (must NEVER fail)
   if (method === "initialize") {
     return res.status(200).json({
       jsonrpc: "2.0",
@@ -41,7 +46,7 @@ export default async function handler(req, res) {
     });
   }
 
-  // Fallback (important: NEVER 400 here)
+  // Safe fallback (never 400)
   return res.status(200).json({
     jsonrpc: "2.0",
     id,
