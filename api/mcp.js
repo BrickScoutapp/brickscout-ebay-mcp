@@ -34,15 +34,21 @@ export default async function handler(req, res) {
     const { method, id } = req.body || {};
 
     if (method === "initialize") {
-      return res.status(200).json({
-        jsonrpc: "2.0",
-        id,
-        result: {
-          name: "eBay MCP",
-          version: "1.0.0"
-        }
-      });
+  return res.status(200).json({
+    jsonrpc: "2.0",
+    id,
+    result: {
+      protocolVersion: "2024-11-05",
+      capabilities: {
+        tools: {}
+      },
+      serverInfo: {
+        name: "eBay MCP",
+        version: "1.0.0"
+      }
     }
+  });
+}
 
     return res.status(200).json({
       jsonrpc: "2.0",
