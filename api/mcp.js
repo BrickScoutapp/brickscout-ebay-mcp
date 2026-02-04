@@ -1,184 +1,280 @@
-export const config = {
-  api: { bodyParser: true },
-};
+export const config = { api: { bodyParser: true } };
 
-// ---- Helpers ----
-function jsonRpcResult(id, result) {
+const EBAY_ENV = (process.env.EBAY_ENV || "production").toLowerCase();
+const EBAY_OAUTH =
+  EBAY_ENV === "sandbox"
+    ? "https://api.sandbox.ebay.com/identity/v1/oauth2/token"
+    : "https://api.ebay.com/identity/v1/oauth2/token";
+
+const EBAY_BROWSE =
+  EBAY_ENV === "sandbox"
+    ? "https://api.sandbox.ebay.com/buy/browse/v1"
+    : "https://api.ebay.com/buy/browse/v1";
+
+const MARKETPLACE_ID = process.env.EBAY_MARKETPLACE_ID || "EBAY_US";
+
+let tokenCache = { accessToken: null, expiresAtMs: 0 };
+
+function sendJson(res, status, body) {
+  res.statusCode = status;
+  res.setHeader("Content-Type", "application/json");
+  res.end(JSON.stringify(body));
+}
+
+function rpcResult(id, result) {
   return { jsonrpc: "2.0", id, result };
 }
-function jsonRpcError(id, code, message, data) {
-  return { jsonrpc: "2.0", id, error: { code, message, data } };
+
+function rpcError(id, message, code = -32000) {
+  return { jsonrpc: "2.0", id, error: { code, message } };
 }
 
-async function getEbayAccessToken() {
-  const EBAY_CLIENT_ID = process.env.EBAY_CLIENT_ID;
-  const EBAY_CLIENT_SECRET = process.env.EBAY_CLIENT_SECRET;
+function toNum(x, fallback = 0) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : fallback;
+}
 
-  if (!EBAY_CLIENT_ID || !EBAY_CLIENT_SECRET) {
-    throw new Error("Missing EBAY_CLIENT_ID or EBAY_CLIENT_SECRET");
+function pickFirst(...vals) {
+  for (const v of vals) {
+    if (v == null) continue;
+    if (typeof v === "string" && v.trim() === "") continue;
+    return v;
+  }
+  return null;
+}
+
+function clampInt(n, min, max, fallback) {
+  const x = Number(n);
+  if (!Number.isFinite(x)) return fallback;
+  return Math.max(min, Math.min(max, Math.floor(x)));
+}
+
+async function getAccessToken() {
+  const now = Date.now();
+  if (tokenCache.accessToken && tokenCache.expiresAtMs - 30_000 > now) {
+    return tokenCache.accessToken;
   }
 
-  const tokenRes = await fetch("https://api.ebay.com/identity/v1/oauth2/token", {
+  const clientId = process.env.EBAY_CLIENT_ID;
+  const clientSecret = process.env.EBAY_CLIENT_SECRET;
+  if (!clientId || !clientSecret) {
+    throw new Error("Missing EBAY_CLIENT_ID / EBAY_CLIENT_SECRET");
+  }
+
+  const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+
+  // ✅ Correct Browse API scope (per eBay docs)
+  const scope = "https://api.ebay.com/oauth/api_scope";
+
+  const resp = await fetch(EBAY_OAUTH, {
     method: "POST",
     headers: {
-      Authorization:
-        "Basic " +
-        Buffer.from(`${EBAY_CLIENT_ID}:${EBAY_CLIENT_SECRET}`).toString("base64"),
+      Authorization: `Basic ${basic}`,
       "Content-Type": "application/x-www-form-urlencoded",
     },
-    body: "grant_type=client_credentials&scope=https://api.ebay.com/oauth/api_scope",
+    body: new URLSearchParams({
+      grant_type: "client_credentials",
+      scope,
+    }).toString(),
   });
 
-  const tokenData = await tokenRes.json();
-  if (!tokenRes.ok || !tokenData.access_token) {
-    throw new Error(
-      `Token request failed: ${JSON.stringify(tokenData).slice(0, 500)}`
-    );
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => "");
+    throw new Error(`eBay OAuth failed (${resp.status}): ${t}`);
   }
 
-  return tokenData.access_token;
+  const data = await resp.json();
+  tokenCache.accessToken = data.access_token;
+  tokenCache.expiresAtMs = now + toNum(data.expires_in, 7200) * 1000;
+
+  return tokenCache.accessToken;
 }
 
-async function searchEbay({ query, limit = 10, marketplaceId = "EBAY_US" }) {
-  if (!query || typeof query !== "string") {
-    throw new Error("Missing or invalid query");
-  }
+async function ebayFetch(path) {
+  const token = await getAccessToken();
 
-  const accessToken = await getEbayAccessToken();
-
-  const url =
-    "https://api.ebay.com/buy/browse/v1/item_summary/search" +
-    `?q=${encodeURIComponent(query)}` +
-    `&limit=${encodeURIComponent(String(limit))}`;
-
-  const ebayRes = await fetch(url, {
+  const resp = await fetch(`${EBAY_BROWSE}${path}`, {
+    method: "GET",
     headers: {
-      Authorization: `Bearer ${accessToken}`,
-      "X-EBAY-C-MARKETPLACE-ID": marketplaceId,
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      "X-EBAY-C-MARKETPLACE-ID": MARKETPLACE_ID,
     },
   });
 
-  const ebayData = await ebayRes.json();
-  if (!ebayRes.ok) {
-    throw new Error(
-      `eBay search failed (${ebayRes.status}): ${JSON.stringify(ebayData).slice(
-        0,
-        500
-      )}`
-    );
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => "");
+    throw new Error(`eBay API error (${resp.status}) ${path}: ${t}`);
   }
 
-  // "Never show sold listings":
-  // Browse search returns active items, but we still guard against ended items.
-  const items = (ebayData.itemSummaries || []).filter((it) => {
-    // If itemEndDate exists and is in the past, treat as ended.
-    // Many summaries include itemEndDate for auction end time; that's fine if still active.
-    // We'll keep it, because "ending soon" needs it.
-    return true;
-  });
-
-  // Normalize minimal fields for the app
-  return items.map((it) => ({
-    itemId: it.itemId,
-    title: it.title,
-    itemWebUrl: it.itemWebUrl,
-    image: it.image?.imageUrl || null,
-    price: it.price?.value ? `${it.price.value}` : null,
-    currency: it.price?.currency || null,
-    shipping: it.shippingOptions?.[0]?.shippingCost?.value ?? null,
-    shippingCurrency: it.shippingOptions?.[0]?.shippingCost?.currency ?? null,
-    seller: it.seller?.username || null,
-    sellerFeedbackPercent: it.seller?.feedbackPercentage ?? null,
-    itemEndDate: it.itemEndDate || null,
-    buyingOptions: it.buyingOptions || [],
-  }));
+  return resp.json();
 }
 
-// ---- MCP Tools ----
-const TOOLS = [
-  {
-    name: "search_ebay",
-    description: "Search live eBay listings (buyer-only).",
-    inputSchema: {
-      type: "object",
-      properties: {
-        query: { type: "string" },
-        limit: { type: "number" },
-        marketplaceId: { type: "string", default: "EBAY_US" },
-      },
-      required: ["query"],
-    },
-  },
-];
+async function browseSearch({ query, limit }) {
+  const lim = clampInt(limit, 1, 50, 25);
 
-// ---- Handler ----
-export default async function handler(req, res) {
-  // CORS (Base44 + browser friendly)
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type,Authorization");
+  const params = new URLSearchParams({
+    q: String(query || ""),
+    limit: String(lim),
+  });
 
-  if (req.method === "OPTIONS") return res.status(200).end();
+  return ebayFetch(`/item_summary/search?${params.toString()}`);
+}
 
-  // Optional health check
-  if (req.method === "GET") {
-    return res.status(200).json({ status: "ok", server: "eBay MCP" });
+async function browseGetItem(restItemId) {
+  return ebayFetch(`/item/${encodeURIComponent(restItemId)}`);
+}
+
+// small concurrency limiter
+async function mapWithConcurrency(arr, concurrency, fn) {
+  const out = new Array(arr.length);
+  let idx = 0;
+
+  async function worker() {
+    while (idx < arr.length) {
+      const i = idx++;
+      out[i] = await fn(arr[i], i);
+    }
   }
 
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Use POST for MCP JSON-RPC" });
-  }
-
-  const body = req.body;
-  const requests = Array.isArray(body) ? body : [body];
-
-  const responses = await Promise.all(
-    requests.map(async (r) => {
-      const id = r?.id ?? null;
-      const method = r?.method;
-
-      try {
-        // MCP initialize
-        if (method === "initialize") {
-          return jsonRpcResult(id, {
-            protocolVersion: "2024-11-05",
-            capabilities: { tools: {} },
-            serverInfo: { name: "eBay MCP", version: "1.0.0" },
-          });
-        }
-
-        // MCP tools/list
-        if (method === "tools/list") {
-          return jsonRpcResult(id, { tools: TOOLS });
-        }
-
-        // MCP tools/call
-        if (method === "tools/call") {
-          const toolName = r?.params?.name;
-          const args = r?.params?.arguments || {};
-
-          if (toolName === "search_ebay") {
-            const data = await searchEbay(args);
-            return jsonRpcResult(id, {
-              content: [{ type: "text", text: JSON.stringify(data) }],
-            });
-          }
-
-          return jsonRpcError(id, -32601, `Unknown tool: ${toolName}`);
-        }
-
-        // Unknown method
-        return jsonRpcError(id, -32601, `Unknown method: ${method}`);
-      } catch (err) {
-        return jsonRpcError(
-          id,
-          -32000,
-          "Server error",
-          err?.message || String(err)
-        );
-      }
-    })
+  await Promise.all(
+    Array.from({ length: Math.min(concurrency, arr.length) }, () => worker())
   );
-
-  return res.status(200).json(responses.length === 1 ? responses[0] : responses);
+  return out;
 }
+
+/**
+ * Returns items in the shape your frontend expects.
+ * IMPORTANT: returns legacyItemId (numeric) + itemWebUrl (best) + image (url)
+ */
+async function searchEbayEnriched({ query, limit }) {
+  const search = await browseSearch({ query, limit });
+  const summaries = Array.isArray(search?.itemSummaries) ? search.itemSummaries : [];
+
+  // RESTful ids (v1|...|0) used for getItem
+  const restIds = summaries.map((s) => s?.itemId).filter(Boolean);
+
+  const details = await mapWithConcurrency(restIds, 5, async (rid) => {
+    try {
+      const d = await browseGetItem(rid);
+      return { rid, ok: true, d };
+    } catch (e) {
+      return { rid, ok: false, error: String(e?.message || e) };
+    }
+  });
+
+  const detailMap = new Map(details.filter((x) => x.ok).map((x) => [x.rid, x.d]));
+
+  return summaries.map((s) => {
+    const rid = s?.itemId || null;
+    const d = rid ? detailMap.get(rid) : null;
+
+    // ✅ legacy numeric id (safe for /itm/{legacyId})
+    const legacyItemId = pickFirst(d?.legacyItemId, s?.legacyItemId, null);
+
+    const title = pickFirst(d?.title, s?.title, "Untitled listing");
+
+    // ✅ best URL (direct)
+    const itemWebUrl = pickFirst(
+      d?.itemWebUrl,
+      s?.itemWebUrl,
+      // fallback to legacy numeric id if present
+      legacyItemId ? `https://www.ebay.com/itm/${legacyItemId}` : null,
+      // last fallback: keyword search
+      `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(title)}`
+    );
+
+    const imageUrl = pickFirst(
+      d?.image?.imageUrl,
+      d?.image?.url,
+      d?.primaryImage?.imageUrl,
+      d?.primaryImage?.url,
+      s?.image?.imageUrl,
+      s?.image?.url,
+      s?.thumbnailImage?.imageUrl,
+      s?.thumbnailImage?.url,
+      null
+    );
+
+    const price =
+      toNum(d?.price?.value, NaN) ||
+      toNum(s?.price?.value, NaN) ||
+      0;
+
+    const shipping =
+      toNum(d?.shippingOptions?.[0]?.shippingCost?.value, NaN) ||
+      toNum(s?.shippingOptions?.[0]?.shippingCost?.value, NaN) ||
+      0;
+
+    const seller = pickFirst(
+      d?.seller?.username,
+      s?.seller?.username,
+      "eBay Seller"
+    );
+
+    const sellerFeedbackPercent =
+      toNum(d?.seller?.feedbackPercentage, NaN) ||
+      toNum(s?.seller?.feedbackPercentage, NaN) ||
+      99;
+
+    return {
+      // keep BOTH ids so frontend can use either
+      itemId: legacyItemId || rid,        // ✅ prefer legacy numeric
+      restItemId: rid,                    // ✅ preserve REST id for debug
+      legacyItemId: legacyItemId || null,
+
+      title,
+      price,
+      shipping,
+      seller,
+      sellerFeedbackPercent,
+
+      itemWebUrl,
+      image: imageUrl || null,
+
+      itemEndDate: pickFirst(d?.itemEndDate, s?.itemEndDate, null),
+      buyingOptions: Array.isArray(s?.buyingOptions) ? s.buyingOptions : [],
+    };
+  });
+}
+
+export default async function handler(req, res) {
+  if (req.method !== "POST") return sendJson(res, 405, { error: "Use POST" });
+
+  const body = req.body || {};
+  const { jsonrpc, id, method, params } = body;
+
+  if (jsonrpc !== "2.0") {
+    return sendJson(res, 400, rpcError(id ?? null, "Invalid jsonrpc", -32600));
+  }
+
+  try {
+    if (method !== "tools/call") {
+      return sendJson(res, 400, rpcError(id, `Unknown method: ${method}`, -32601));
+    }
+
+    const toolName = params?.name;
+    const args = params?.arguments || {};
+
+    if (toolName === "search_ebay") {
+      const query = String(args?.query || "");
+      const limit = clampInt(args?.limit, 1, 50, 25);
+
+      const enriched = await searchEbayEnriched({ query, limit });
+
+      return sendJson(
+        res,
+        200,
+        rpcResult(id, {
+          content: [{ type: "text", text: JSON.stringify(enriched) }],
+        })
+      );
+    }
+
+    return sendJson(res, 400, rpcError(id, `Unknown tool: ${toolName}`, -32601));
+  } catch (e) {
+    // Return an MCP-friendly error; you’ll see this message in your frontend debugError if you log it
+    return sendJson(res, 200, rpcError(id ?? null, String(e?.message || e)));
+  }
+}
+
