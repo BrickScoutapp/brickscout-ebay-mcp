@@ -11,6 +11,7 @@ const EBAY_BROWSE =
     ? "https://api.sandbox.ebay.com/buy/browse/v1"
     : "https://api.ebay.com/buy/browse/v1";
 
+// Default marketplace
 const MARKETPLACE_ID = process.env.EBAY_MARKETPLACE_ID || "EBAY_US";
 
 let tokenCache = { accessToken: null, expiresAtMs: 0 };
@@ -49,6 +50,33 @@ function clampInt(n, min, max, fallback) {
   return Math.max(min, Math.min(max, Math.floor(x)));
 }
 
+/**
+ * Browse API search does NOT behave like ebay.com search.
+ * - Strip "-keyword" tokens (your frontend adds these)
+ * - Strip super noisy operators
+ */
+function sanitizeBrowseQuery(raw) {
+  const s = String(raw || "").trim();
+  if (!s) return "";
+
+  const tokens = s.split(/\s+/g);
+
+  // Remove minus tokens and obvious boolean operators that cause weird matching
+  const cleaned = tokens.filter((t) => {
+    if (!t) return false;
+    if (t.startsWith("-")) return false; // <- KEY FIX
+    if (t === "OR" || t === "AND" || t === "NOT") return false;
+    return true;
+  });
+
+  // Avoid returning empty
+  const out = cleaned.join(" ").trim();
+  return out || s.replace(/-\S+/g, "").trim() || "";
+}
+
+/* -------------------------
+   OAuth: Client Credentials
+-------------------------- */
 async function getAccessToken() {
   const now = Date.now();
   if (tokenCache.accessToken && tokenCache.expiresAtMs - 30_000 > now) {
@@ -63,7 +91,7 @@ async function getAccessToken() {
 
   const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
 
-  // ✅ Correct Browse API scope (per eBay docs)
+  // ✅ Correct generic scope for Browse API
   const scope = "https://api.ebay.com/oauth/api_scope";
 
   const resp = await fetch(EBAY_OAUTH, {
@@ -86,7 +114,6 @@ async function getAccessToken() {
   const data = await resp.json();
   tokenCache.accessToken = data.access_token;
   tokenCache.expiresAtMs = now + toNum(data.expires_in, 7200) * 1000;
-
   return tokenCache.accessToken;
 }
 
@@ -110,11 +137,17 @@ async function ebayFetch(path) {
   return resp.json();
 }
 
+/* -------------------------
+   eBay Browse helpers
+-------------------------- */
 async function browseSearch({ query, limit }) {
   const lim = clampInt(limit, 1, 50, 25);
 
+  // ✅ sanitize query so Browse search actually returns results
+  const cleaned = sanitizeBrowseQuery(query);
+
   const params = new URLSearchParams({
-    q: String(query || ""),
+    q: cleaned || "LEGO",
     limit: String(lim),
   });
 
@@ -125,7 +158,7 @@ async function browseGetItem(restItemId) {
   return ebayFetch(`/item/${encodeURIComponent(restItemId)}`);
 }
 
-// small concurrency limiter
+// concurrency limiter
 async function mapWithConcurrency(arr, concurrency, fn) {
   const out = new Array(arr.length);
   let idx = 0;
@@ -144,14 +177,14 @@ async function mapWithConcurrency(arr, concurrency, fn) {
 }
 
 /**
- * Returns items in the shape your frontend expects.
- * IMPORTANT: returns legacyItemId (numeric) + itemWebUrl (best) + image (url)
+ * Returns items in the shape your frontend expects
+ * (matches your normalizeMcpToDealScoringShape)
  */
 async function searchEbayEnriched({ query, limit }) {
   const search = await browseSearch({ query, limit });
   const summaries = Array.isArray(search?.itemSummaries) ? search.itemSummaries : [];
 
-  // RESTful ids (v1|...|0) used for getItem
+  // RESTful ids used for getItem: e.g. v1|123...|0
   const restIds = summaries.map((s) => s?.itemId).filter(Boolean);
 
   const details = await mapWithConcurrency(restIds, 5, async (rid) => {
@@ -169,30 +202,21 @@ async function searchEbayEnriched({ query, limit }) {
     const rid = s?.itemId || null;
     const d = rid ? detailMap.get(rid) : null;
 
-    // ✅ legacy numeric id (safe for /itm/{legacyId})
     const legacyItemId = pickFirst(d?.legacyItemId, s?.legacyItemId, null);
-
     const title = pickFirst(d?.title, s?.title, "Untitled listing");
 
-    // ✅ best URL (direct)
     const itemWebUrl = pickFirst(
       d?.itemWebUrl,
       s?.itemWebUrl,
-      // fallback to legacy numeric id if present
       legacyItemId ? `https://www.ebay.com/itm/${legacyItemId}` : null,
-      // last fallback: keyword search
       `https://www.ebay.com/sch/i.html?_nkw=${encodeURIComponent(title)}`
     );
 
     const imageUrl = pickFirst(
       d?.image?.imageUrl,
-      d?.image?.url,
       d?.primaryImage?.imageUrl,
-      d?.primaryImage?.url,
       s?.image?.imageUrl,
-      s?.image?.url,
       s?.thumbnailImage?.imageUrl,
-      s?.thumbnailImage?.url,
       null
     );
 
@@ -206,7 +230,7 @@ async function searchEbayEnriched({ query, limit }) {
       toNum(s?.shippingOptions?.[0]?.shippingCost?.value, NaN) ||
       0;
 
-    const seller = pickFirst(
+    const sellerUsername = pickFirst(
       d?.seller?.username,
       s?.seller?.username,
       "eBay Seller"
@@ -218,26 +242,24 @@ async function searchEbayEnriched({ query, limit }) {
       99;
 
     return {
-      // keep BOTH ids so frontend can use either
-      itemId: legacyItemId || rid,        // ✅ prefer legacy numeric
-      restItemId: rid,                    // ✅ preserve REST id for debug
-      legacyItemId: legacyItemId || null,
-
+      // IMPORTANT: keep this compatible with your frontend normalizer
+      itemId: legacyItemId || rid,
       title,
       price,
-      shipping,
-      seller,
+      shipping, // <- your frontend uses it.shipping
+      seller: sellerUsername,
       sellerFeedbackPercent,
-
       itemWebUrl,
       image: imageUrl || null,
-
       itemEndDate: pickFirst(d?.itemEndDate, s?.itemEndDate, null),
       buyingOptions: Array.isArray(s?.buyingOptions) ? s.buyingOptions : [],
     };
   });
 }
 
+/* -------------------------
+   MCP JSON-RPC handler
+-------------------------- */
 export default async function handler(req, res) {
   if (req.method !== "POST") return sendJson(res, 405, { error: "Use POST" });
 
@@ -273,8 +295,8 @@ export default async function handler(req, res) {
 
     return sendJson(res, 400, rpcError(id, `Unknown tool: ${toolName}`, -32601));
   } catch (e) {
-    // Return an MCP-friendly error; you’ll see this message in your frontend debugError if you log it
     return sendJson(res, 200, rpcError(id ?? null, String(e?.message || e)));
   }
 }
+
 
