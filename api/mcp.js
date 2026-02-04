@@ -1,6 +1,8 @@
 /* api/mcp.js
- * CommonJS version (Vercel-safe)
- * Fixes: handler not exported → Failed to fetch
+ * Vercel Node Function (CommonJS)
+ * - CORS enabled (prevents "Failed to fetch" from browser)
+ * - OPTIONS preflight supported
+ * - eBay Browse API search + enrichment via getItem
  */
 
 const EBAY_ENV = (process.env.EBAY_ENV || "production").toLowerCase();
@@ -17,16 +19,27 @@ const EBAY_BROWSE =
 
 const MARKETPLACE_ID = process.env.EBAY_MARKETPLACE_ID || "EBAY_US";
 
-let tokenCache = {
-  accessToken: null,
-  expiresAtMs: 0,
-};
+let tokenCache = { accessToken: null, expiresAtMs: 0 };
+
+/* -------------------------
+   CORS (IMPORTANT)
+-------------------------- */
+function setCors(res) {
+  // If you want to lock this down later, replace "*" with your Base44 domain.
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    "Content-Type, Authorization, X-Requested-With"
+  );
+  res.setHeader("Access-Control-Max-Age", "86400");
+}
 
 /* -------------------------
    Helpers
 -------------------------- */
-
 function sendJson(res, status, body) {
+  setCors(res);
   res.statusCode = status;
   res.setHeader("Content-Type", "application/json");
   res.end(JSON.stringify(body));
@@ -60,18 +73,18 @@ function clampInt(n, min, max, fallback) {
   return Math.max(min, Math.min(max, Math.floor(x)));
 }
 
-/* -------------------------
-   Query sanitizer
--------------------------- */
+/**
+ * Browse API search ≠ ebay.com search
+ * Remove "-keyword" tokens (your frontend adds these)
+ */
 function sanitizeBrowseQuery(raw) {
   const s = String(raw || "").trim();
   if (!s) return "";
-
   const tokens = s.split(/\s+/g);
 
   const cleaned = tokens.filter((t) => {
     if (!t) return false;
-    if (t.startsWith("-")) return false;
+    if (t.startsWith("-")) return false; // KEY
     if (t === "OR" || t === "AND" || t === "NOT") return false;
     return true;
   });
@@ -85,20 +98,19 @@ function sanitizeBrowseQuery(raw) {
 -------------------------- */
 async function getAccessToken() {
   const now = Date.now();
-
   if (tokenCache.accessToken && tokenCache.expiresAtMs - 30000 > now) {
     return tokenCache.accessToken;
   }
 
   const clientId = process.env.EBAY_CLIENT_ID;
   const clientSecret = process.env.EBAY_CLIENT_SECRET;
-
   if (!clientId || !clientSecret) {
     throw new Error("Missing EBAY_CLIENT_ID / EBAY_CLIENT_SECRET");
   }
 
   const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
 
+  // Browse API scope
   const scope = "https://api.ebay.com/oauth/api_scope";
 
   const resp = await fetch(EBAY_OAUTH, {
@@ -119,15 +131,13 @@ async function getAccessToken() {
   }
 
   const data = await resp.json();
-
   tokenCache.accessToken = data.access_token;
   tokenCache.expiresAtMs = now + toNum(data.expires_in, 7200) * 1000;
-
   return tokenCache.accessToken;
 }
 
 /* -------------------------
-   eBay API
+   eBay Browse API
 -------------------------- */
 async function ebayFetch(path) {
   const token = await getAccessToken();
@@ -143,7 +153,7 @@ async function ebayFetch(path) {
 
   if (!resp.ok) {
     const t = await resp.text().catch(() => "");
-    throw new Error(`eBay API ${resp.status}: ${t}`);
+    throw new Error(`eBay API ${resp.status} ${path}: ${t}`);
   }
 
   return resp.json();
@@ -180,14 +190,15 @@ async function mapWithConcurrency(arr, concurrency, fn) {
   }
 
   await Promise.all(
-    Array.from({ length: Math.min(concurrency, arr.length) }, worker)
+    Array.from({ length: Math.min(concurrency, arr.length) }, () => worker())
   );
-
   return out;
 }
 
 /* -------------------------
    Enriched search
+   Returns shape your frontend already expects:
+   { itemId, title, price, shipping, seller, sellerFeedbackPercent, itemWebUrl, image }
 -------------------------- */
 async function searchEbayEnriched({ query, limit }) {
   const search = await browseSearch({ query, limit });
@@ -201,13 +212,13 @@ async function searchEbayEnriched({ query, limit }) {
     try {
       const d = await browseGetItem(rid);
       return { ok: true, rid, d };
-    } catch {
-      return { ok: false, rid };
+    } catch (e) {
+      return { ok: false, rid, error: String(e?.message || e) };
     }
   });
 
   const detailMap = new Map(
-    details.filter((x) => x.ok).map((x) => [x.rid, x.d])
+    details.filter((x) => x.ok && x.d).map((x) => [x.rid, x.d])
   );
 
   return summaries.map((s) => {
@@ -270,13 +281,23 @@ async function searchEbayEnriched({ query, limit }) {
    Vercel handler
 -------------------------- */
 module.exports = async function handler(req, res) {
+  // Always set CORS headers
+  setCors(res);
+
+  // ✅ Handle preflight
+  if (req.method === "OPTIONS") {
+    res.statusCode = 204;
+    return res.end();
+  }
+
   if (req.method !== "POST") {
     return sendJson(res, 405, { error: "Use POST" });
   }
 
+  // If env vars missing, return a real JSON error (not a network failure)
   if (!process.env.EBAY_CLIENT_ID || !process.env.EBAY_CLIENT_SECRET) {
     return sendJson(res, 500, {
-      error: "Missing eBay credentials",
+      error: "Server misconfigured: missing eBay credentials",
     });
   }
 
@@ -312,10 +333,9 @@ module.exports = async function handler(req, res) {
 
     return sendJson(res, 400, rpcError(id, `Unknown tool: ${tool}`, -32601));
   } catch (e) {
-    console.error("MCP error:", e);
+    console.error("MCP runtime error:", e);
     return sendJson(res, 200, rpcError(id ?? null, String(e?.message || e)));
   }
 };
-
 
 
