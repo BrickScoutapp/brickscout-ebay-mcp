@@ -1,6 +1,103 @@
-// FULL REPLACEMENT MCP SERVER HANDLER
+// FULL REPLACEMENT MCP SERVER HANDLER (AUTO TOKEN REFRESH)
 // Supports: query, limit, offset, sort
 // sort: BEST_MATCH | PRICE_DESC | PRICE_ASC | ENDING_SOON
+//
+// Required env vars (Vercel):
+// - EBAY_CLIENT_ID
+// - EBAY_CLIENT_SECRET
+// - EBAY_REFRESH_TOKEN
+//
+// Optional env vars:
+// - EBAY_ENV = "production" | "sandbox" (default "production")
+// - EBAY_MARKETPLACE_ID = "EBAY_US" (default "EBAY_US")
+
+let cachedToken = null;
+let cachedTokenExpiresAt = 0; // epoch ms
+
+function getEbayBaseUrl() {
+  return String(process.env.EBAY_ENV || "production").toLowerCase() === "sandbox"
+    ? "https://api.sandbox.ebay.com"
+    : "https://api.ebay.com";
+}
+
+function getMarketplaceId() {
+  return process.env.EBAY_MARKETPLACE_ID || "EBAY_US";
+}
+
+async function getEbayAccessToken() {
+  const now = Date.now();
+  // 60s safety buffer
+  if (cachedToken && cachedTokenExpiresAt - now > 60_000) return cachedToken;
+
+  const clientId = process.env.EBAY_CLIENT_ID;
+  const clientSecret = process.env.EBAY_CLIENT_SECRET;
+  const refreshToken = process.env.EBAY_REFRESH_TOKEN;
+
+  if (!clientId || !clientSecret || !refreshToken) {
+    throw new Error(
+      "Missing eBay env vars. Set EBAY_CLIENT_ID, EBAY_CLIENT_SECRET, EBAY_REFRESH_TOKEN."
+    );
+  }
+
+  const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
+
+  const tokenUrl = `${getEbayBaseUrl()}/identity/v1/oauth2/token`;
+  const body = new URLSearchParams({
+    grant_type: "refresh_token",
+    refresh_token: refreshToken,
+    // Typical scope for Browse API search. If your app uses different scopes,
+    // adjust accordingly to what your eBay app is approved for.
+    scope: "https://api.ebay.com/oauth/api_scope",
+  });
+
+  const resp = await fetch(tokenUrl, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      Authorization: `Basic ${basic}`,
+    },
+    body,
+  });
+
+  const json = await resp.json().catch(() => null);
+
+  if (!resp.ok) {
+    throw new Error(
+      `eBay token refresh failed (${resp.status}): ${JSON.stringify(json)}`
+    );
+  }
+
+  const token = json?.access_token;
+  const expiresInSec = Number(json?.expires_in || 0);
+
+  if (!token || !expiresInSec) {
+    throw new Error(`eBay token refresh returned unexpected payload: ${JSON.stringify(json)}`);
+  }
+
+  cachedToken = token;
+  cachedTokenExpiresAt = Date.now() + expiresInSec * 1000;
+
+  return cachedToken;
+}
+
+function mcpOk(id, payloadArray) {
+  return {
+    jsonrpc: "2.0",
+    id: id ?? 1,
+    result: { content: [{ type: "text", text: JSON.stringify(payloadArray || []) }] },
+  };
+}
+
+function mcpErr(id, message, status = 500) {
+  return {
+    status,
+    body: {
+      jsonrpc: "2.0",
+      id: id ?? 1,
+      error: { message: message || "Server error" },
+    },
+  };
+}
 
 export default async function handler(req, res) {
   try {
@@ -10,103 +107,77 @@ export default async function handler(req, res) {
     }
 
     const body = req.body || {};
+    const id = body?.id ?? 1;
+
     const method = body?.method;
     const toolName = body?.params?.name;
     const args = body?.params?.arguments || {};
 
-    // Only handle the MCP tools/call pattern you’re already using
     if (method !== "tools/call" || toolName !== "search_ebay") {
       res.status(400).json({
         jsonrpc: "2.0",
-        id: body?.id ?? 1,
+        id,
         error: { message: "Unsupported method/tool" },
       });
       return;
     }
 
     const query = String(args?.query || "").trim();
-    const limit = Number(args?.limit ?? 50);
-    const offset = Number(args?.offset ?? 0);
+    const limitRaw = Number(args?.limit ?? 50);
+    const offsetRaw = Number(args?.offset ?? 0);
     const sort = String(args?.sort || "BEST_MATCH").toUpperCase();
 
     if (!query) {
-      res.status(200).json({
-        jsonrpc: "2.0",
-        id: body?.id ?? 1,
-        result: { content: [{ type: "text", text: "[]" }] },
-      });
+      res.status(200).json(mcpOk(id, []));
       return;
     }
 
-    // Map your UI sort to eBay Browse API sort names
-    // eBay Browse API sort options include:
-    // - price (asc/desc) by "price"
-    // - ending soon: "endingSoonest"
-    // - best match: default (omit)
-    const ebaySort =
-      sort === "PRICE_DESC"
-        ? "price"
-        : sort === "PRICE_ASC"
-        ? "price"
-        : sort === "ENDING_SOON"
-        ? "endingSoonest"
-        : null;
+    const limit = Math.min(Math.max(limitRaw, 1), 200);
+    const offset = Math.max(offsetRaw, 0);
 
-    const ebaySortOrder =
-      sort === "PRICE_DESC" ? "DESC" : sort === "PRICE_ASC" ? "ASC" : null;
+    // eBay Browse API sort mapping:
+    // - default best match: omit sort params
+    // - ending soon: sort=endingSoonest
+    // - price: sort=price with sortOrder ASC/DESC
+    let ebaySort = null;
+    let ebaySortOrder = null;
 
-    // ✅ IMPORTANT:
-    // This example assumes you are using the eBay Browse API (buy/browse/v1/item_summary/search)
-    // and you have an OAuth App access token ready to use.
-    //
-    // You MUST set these env vars in Vercel:
-    // - EBAY_BEARER_TOKEN  (OAuth token with browse scope)
-    //
-    // If your current server uses a different auth flow, paste it here and I’ll adapt it.
-
-    const token = process.env.EBAY_BEARER_TOKEN;
-    if (!token) {
-      res.status(500).json({
-        jsonrpc: "2.0",
-        id: body?.id ?? 1,
-        error: { message: "Missing EBAY_BEARER_TOKEN env var" },
-      });
-      return;
+    if (sort === "ENDING_SOON") {
+      ebaySort = "endingSoonest";
+    } else if (sort === "PRICE_DESC") {
+      ebaySort = "price";
+      ebaySortOrder = "DESC";
+    } else if (sort === "PRICE_ASC") {
+      ebaySort = "price";
+      ebaySortOrder = "ASC";
     }
 
-    // Build eBay search URL
     const params = new URLSearchParams();
     params.set("q", query);
-    params.set("limit", String(Math.min(Math.max(limit, 1), 200))); // eBay max varies; keep safe
-    params.set("offset", String(Math.max(offset, 0)));
+    params.set("limit", String(limit));
+    params.set("offset", String(offset));
 
-    // Sorting:
-    // eBay browse uses: sort=endingSoonest OR sort=price
-    // For price direction, we can use "sort" plus a filter; in some implementations,
-    // price direction is controlled by sortOrder or by using "sort=price" + "sortOrder=DESC".
     if (ebaySort) params.set("sort", ebaySort);
     if (ebaySortOrder) params.set("sortOrder", ebaySortOrder);
 
-    // Optional: keep it LEGO-ish but not overly restrictive
-    // If you have categoryId for LEGO sets, you can include it:
-    // params.set("category_ids", "183417");
+    const url = `${getEbayBaseUrl()}/buy/browse/v1/item_summary/search?${params.toString()}`;
 
-    const url = `https://api.ebay.com/buy/browse/v1/item_summary/search?${params.toString()}`;
+    const token = await getEbayAccessToken();
 
     const r = await fetch(url, {
       headers: {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
-        // Optional affiliate headers if you use them:
-        // "X-EBAY-C-ENDUSERCTX": "...",
+        "X-EBAY-C-MARKETPLACE-ID": getMarketplaceId(),
       },
     });
 
     const text = await r.text();
+
     if (!r.ok) {
       res.status(r.status).json({
         jsonrpc: "2.0",
-        id: body?.id ?? 1,
+        id,
         error: { message: `eBay error (${r.status}): ${text}` },
       });
       return;
@@ -115,10 +186,15 @@ export default async function handler(req, res) {
     const data = JSON.parse(text);
     const items = Array.isArray(data?.itemSummaries) ? data.itemSummaries : [];
 
-    // Normalize a bit so your client can keep using it?.price etc.
     const simplified = items.map((it) => {
       const priceVal = Number(it?.price?.value ?? 0);
-      const shippingVal = Number(it?.shippingOptions?.[0]?.shippingCost?.value ?? 0);
+
+      // shippingOptions is often missing; be defensive
+      const shippingVal = Number(
+        it?.shippingOptions?.[0]?.shippingCost?.value ??
+          it?.shippingOptions?.[0]?.shippingCost?.convertedFromValue ??
+          0
+      );
 
       return {
         id: it?.itemId || null,
@@ -135,13 +211,7 @@ export default async function handler(req, res) {
       };
     });
 
-    res.status(200).json({
-      jsonrpc: "2.0",
-      id: body?.id ?? 1,
-      result: {
-        content: [{ type: "text", text: JSON.stringify(simplified) }],
-      },
-    });
+    res.status(200).json(mcpOk(id, simplified));
   } catch (e) {
     res.status(500).json({
       jsonrpc: "2.0",
@@ -150,6 +220,7 @@ export default async function handler(req, res) {
     });
   }
 }
+
 
 
 
