@@ -1,4 +1,4 @@
-// FULL REPLACEMENT MCP SERVER HANDLER (AUTO TOKEN REFRESH)
+// FULL REPLACEMENT MCP SERVER HANDLER (AUTO TOKEN REFRESH + EDGE SAFE)
 // Supports: query, limit, offset, sort
 // sort: BEST_MATCH | PRICE_DESC | PRICE_ASC | ENDING_SOON
 //
@@ -10,18 +10,47 @@
 // Optional env vars:
 // - EBAY_ENV = "production" | "sandbox" (default "production")
 // - EBAY_MARKETPLACE_ID = "EBAY_US" (default "EBAY_US")
+// - EBAY_OAUTH_SCOPE = "https://api.ebay.com/oauth/api_scope" (default shown)
 
 let cachedToken = null;
 let cachedTokenExpiresAt = 0; // epoch ms
 
-function getEbayBaseUrl() {
+function getEbayEnv() {
   return String(process.env.EBAY_ENV || "production").toLowerCase() === "sandbox"
+    ? "sandbox"
+    : "production";
+}
+
+function getEbayBaseUrl() {
+  return getEbayEnv() === "sandbox"
     ? "https://api.sandbox.ebay.com"
     : "https://api.ebay.com";
 }
 
 function getMarketplaceId() {
   return process.env.EBAY_MARKETPLACE_ID || "EBAY_US";
+}
+
+function getOauthScope() {
+  // Allow override without code changes if eBay requires different scopes
+  return process.env.EBAY_OAUTH_SCOPE || "https://api.ebay.com/oauth/api_scope";
+}
+
+// Edge-safe base64 (Buffer may not exist on edge)
+function toBase64(str) {
+  try {
+    // Node
+    if (typeof Buffer !== "undefined") return Buffer.from(str).toString("base64");
+  } catch {}
+  // Edge / Browser-like
+  if (typeof btoa !== "undefined") return btoa(str);
+
+  // Last resort: manual encoding
+  const bytes = new TextEncoder().encode(str);
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  // eslint-disable-next-line no-undef
+  return btoa(binary);
 }
 
 async function getEbayAccessToken() {
@@ -39,15 +68,13 @@ async function getEbayAccessToken() {
     );
   }
 
-  const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
-
+  const basic = toBase64(`${clientId}:${clientSecret}`);
   const tokenUrl = `${getEbayBaseUrl()}/identity/v1/oauth2/token`;
+
   const body = new URLSearchParams({
     grant_type: "refresh_token",
     refresh_token: refreshToken,
-    // Typical scope for Browse API search. If your app uses different scopes,
-    // adjust accordingly to what your eBay app is approved for.
-    scope: "https://api.ebay.com/oauth/api_scope",
+    scope: getOauthScope(),
   });
 
   const resp = await fetch(tokenUrl, {
@@ -63,7 +90,9 @@ async function getEbayAccessToken() {
 
   if (!resp.ok) {
     throw new Error(
-      `eBay token refresh failed (${resp.status}): ${JSON.stringify(json)}`
+      `eBay token refresh failed (${resp.status}) [env=${getEbayEnv()} scope=${getOauthScope()}]: ${JSON.stringify(
+        json
+      )}`
     );
   }
 
@@ -71,7 +100,9 @@ async function getEbayAccessToken() {
   const expiresInSec = Number(json?.expires_in || 0);
 
   if (!token || !expiresInSec) {
-    throw new Error(`eBay token refresh returned unexpected payload: ${JSON.stringify(json)}`);
+    throw new Error(
+      `eBay token refresh returned unexpected payload: ${JSON.stringify(json)}`
+    );
   }
 
   cachedToken = token;
@@ -84,17 +115,10 @@ function mcpOk(id, payloadArray) {
   return {
     jsonrpc: "2.0",
     id: id ?? 1,
-    result: { content: [{ type: "text", text: JSON.stringify(payloadArray || []) }] },
-  };
-}
-
-function mcpErr(id, message, status = 500) {
-  return {
-    status,
-    body: {
-      jsonrpc: "2.0",
-      id: id ?? 1,
-      error: { message: message || "Server error" },
+    result: {
+      content: [
+        { type: "text", text: JSON.stringify(payloadArray || []) },
+      ],
     },
   };
 }
@@ -135,10 +159,6 @@ export default async function handler(req, res) {
     const limit = Math.min(Math.max(limitRaw, 1), 200);
     const offset = Math.max(offsetRaw, 0);
 
-    // eBay Browse API sort mapping:
-    // - default best match: omit sort params
-    // - ending soon: sort=endingSoonest
-    // - price: sort=price with sortOrder ASC/DESC
     let ebaySort = null;
     let ebaySortOrder = null;
 
@@ -156,7 +176,6 @@ export default async function handler(req, res) {
     params.set("q", query);
     params.set("limit", String(limit));
     params.set("offset", String(offset));
-
     if (ebaySort) params.set("sort", ebaySort);
     if (ebaySortOrder) params.set("sortOrder", ebaySortOrder);
 
@@ -169,6 +188,8 @@ export default async function handler(req, res) {
         Authorization: `Bearer ${token}`,
         "Content-Type": "application/json",
         "X-EBAY-C-MARKETPLACE-ID": getMarketplaceId(),
+        // This can improve consistency for some marketplaces
+        "Content-Language": "en-US",
       },
     });
 
@@ -178,7 +199,9 @@ export default async function handler(req, res) {
       res.status(r.status).json({
         jsonrpc: "2.0",
         id,
-        error: { message: `eBay error (${r.status}): ${text}` },
+        error: {
+          message: `eBay error (${r.status}) [env=${getEbayEnv()} marketplace=${getMarketplaceId()}]: ${text}`,
+        },
       });
       return;
     }
@@ -188,8 +211,6 @@ export default async function handler(req, res) {
 
     const simplified = items.map((it) => {
       const priceVal = Number(it?.price?.value ?? 0);
-
-      // shippingOptions is often missing; be defensive
       const shippingVal = Number(
         it?.shippingOptions?.[0]?.shippingCost?.value ??
           it?.shippingOptions?.[0]?.shippingCost?.convertedFromValue ??
@@ -220,6 +241,7 @@ export default async function handler(req, res) {
     });
   }
 }
+
 
 
 
